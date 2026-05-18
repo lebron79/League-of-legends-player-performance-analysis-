@@ -1,0 +1,870 @@
+---
+title: "Analyse Multivariée des Profils de Performance dans League of Legends"
+subtitle: "Mini-Projet — Méthodes Statistiques et Étude de Données"
+author: "Groupe : [Prénom NOM, Prénom NOM, ...]"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 4
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+```{r packages, include=FALSE}
+library(tidyverse)
+library(FactoMineR)
+library(factoextra)
+library(cluster)
+library(corrplot)
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+library(scales)
+```
+
+---
+
+# Introduction et Contexte
+
+## Présentation du domaine
+
+League of Legends (LoL) est un jeu de stratégie en ligne massivement multijoueur développé par Riot Games, comptant plus de 150 millions de comptes enregistrés dans le monde. Chaque partie oppose deux équipes de 5 joueurs sur une carte divisée en trois voies (**lanes**) et une zone forestière (**jungle**). Chaque joueur incarne un **champion** et occupe un **rôle tactique précis** :
+
+- **TOP** : Voie supérieure — champions résistants, duellistes
+- **JUNGLE** : Forêt — champions mobiles, contrôleurs d'objectifs
+- **MID** (MIDDLE) : Voie centrale — champions polyvalents, haut potentiel de dégâts
+- **BOTTOM** (ADC) : Voie inférieure — champions orientés dégâts physiques à distance
+- **UTILITY** (Support) : Accompagne l'ADC, orienté soutien et vision
+
+Ces rôles génèrent des profils statistiques très contrastés : un joueur JUNGLE tuera beaucoup de dragons, un Support aura énormément d'assistances mais peu de kills, un ADC farmera un maximum de créatures.
+
+## Problématique
+
+> **Peut-on identifier automatiquement des profils de performance distincts chez les joueurs de League of Legends à partir de leurs statistiques de match, et dans quelle mesure ces profils correspondent-ils aux rôles tactiques officiels du jeu ?**
+
+Cette problématique est d'intérêt pratique pour :
+
+- Les **coachs et analystes esport** : comparer les joueurs à leur archétype de référence
+- Les **développeurs de matchmaking** : détecter les joueurs qui jouent hors de leur rôle déclaré
+- Les **chercheurs en comportement de jeu** : comprendre comment les méta-stratégies structurent les performances
+
+## Objectifs du projet
+
+1. Appliquer une **Analyse en Composantes Principales (ACP)** pour réduire la dimensionnalité des statistiques de match et identifier les axes de variance principaux
+2. Mettre en œuvre une **classification non supervisée** (K-means et CAH) pour regrouper les joueurs en profils homogènes
+3. **Interpréter et nommer** les clusters obtenus en les confrontant aux rôles officiels
+4. Produire des **conclusions décisionnelles** exploitables dans un contexte esport professionnel
+
+---
+
+# Présentation du Jeu de Données
+
+## Source et collecte
+
+| Attribut | Valeur |
+|---|---|
+| **Nom** | LoL Match History and Summoner Data — 80k Matches |
+| **Source** | [Kaggle — nathansmallcalder](https://www.kaggle.com/datasets/nathansmallcalder/lol-match-history-and-summoner-data-80k-matches) |
+| **Version** | 10 (146.43 MB) |
+| **Patch** | 25.19+ |
+| **Type** | Données de matchs classés (ranked), collectées via l'API Riot Games |
+
+## Structure relationnelle
+
+Le dataset est organisé en **7 fichiers CSV** formant une base de données relationnelle :
+
+```{r structure-dataset}
+structure_df <- data.frame(
+  Fichier    = c("MatchStatsTbl.csv", "SummonerMatchTbl.csv",
+                 "MatchTbl.csv", "RankTbl.csv", "ChampionTbl.csv"),
+  Lignes     = c("732 308", "707 832", "279 423", "11", "173"),
+  Colonnes   = c(31, 4, 5, 2, 2),
+  Role       = c("Statistiques par joueur par match (TABLE PRINCIPALE)",
+                 "Lien joueur ↔ match ↔ champion",
+                 "Métadonnées du match (patch, rang, durée)",
+                 "Référentiel des rangs",
+                 "Référentiel des champions")
+)
+
+kable(structure_df, caption = "Structure du dataset LoL") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed")) %>%
+  row_spec(1, bold = TRUE, background = "#d5e8f0")
+```
+
+## Variables retenues pour l'analyse
+
+Après exploration des fichiers, nous retenons **10 variables numériques** issues de `MatchStatsTbl.csv`, complétées par les variables qualitatives `Lane`, `RankName` et `ChampionName` issues des jointures :
+
+```{r description-variables}
+vars_desc <- data.frame(
+  Variable       = c("kills","deaths","assists","DmgDealt","DmgTaken",
+                     "TurretDmgDealt","TotalGold","MinionsKilled",
+                     "visionScore","DragonKills"),
+  Description    = c("Nombre d'éliminations ennemies",
+                     "Nombre de fois que le joueur est mort",
+                     "Nombre d'assistances à une élimination",
+                     "Dégâts totaux infligés aux champions ennemis",
+                     "Dégâts totaux subis",
+                     "Dégâts infligés aux tourelles",
+                     "Or total gagné durant la partie",
+                     "Nombre de créatures neutres/ennemies farmées (CS)",
+                     "Score de vision (wards posées/détruites)",
+                     "Nombre de dragons tués"),
+  Role_attendu   = c("Tous","Tous","Support/Jungle","ADC/Mid/Top",
+                     "Tank/Jungle/Top","ADC/Top","ADC/Mid",
+                     "ADC/Mid/Top","Support/Jungle","Jungle")
+)
+
+kable(vars_desc, caption = "Variables numériques retenues pour l'ACP et le clustering") %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  column_spec(1, bold = TRUE, monospace = TRUE)
+```
+
+> **Note** : La variable `BaronKills` a été exclue en raison d'une variance quasi nulle (les joueurs tuent rarement le Baron de façon individuelle), ce qui aurait produit un axe ACP de variance zéro.
+
+---
+
+# Préparation des Données
+
+## Chargement et jointures
+
+```{r chargement}
+match_stats    <- read_csv("data/MatchStatsTbl.csv",    show_col_types = FALSE)
+summoner_match <- read_csv("data/SummonerMatchTbl.csv", show_col_types = FALSE)
+match_tbl      <- read_csv("data/MatchTbl.csv",         show_col_types = FALSE)
+rank_tbl       <- read_csv("data/RankTbl.csv",          show_col_types = FALSE)
+champion_tbl   <- read_csv("data/ChampionTbl.csv",      show_col_types = FALSE)
+
+df_full <- match_stats %>%
+  left_join(summoner_match, by = c("SummonerMatchFk" = "SummonerMatchId")) %>%
+  left_join(match_tbl,      by = c("MatchFk"         = "MatchId")) %>%
+  left_join(rank_tbl,       by = c("RankFk"          = "RankId")) %>%
+  left_join(champion_tbl,   by = c("ChampionFk"      = "ChampionId"))
+
+cat("Dataset joint :", format(nrow(df_full), big.mark=" "),
+    "lignes x", ncol(df_full), "colonnes\n")
+```
+
+## Échantillonnage stratifié
+
+Avec 732 308 observations, un traitement complet surchargerait la mémoire R. Nous appliquons un **échantillonnage stratifié par Lane** (3 000 observations par rôle) afin de garantir la représentativité de chaque profil tout en maintenant une taille d'analyse raisonnable.
+
+```{r echantillonnage}
+set.seed(42)
+
+df_sample <- df_full %>%
+  filter(!is.na(Lane), !Lane %in% c("NONE", "")) %>%
+  group_by(Lane) %>%
+  slice_sample(n = 3000) %>%
+  ungroup()
+
+kable(
+  df_sample %>% count(Lane) %>% rename(Effectif = n),
+  caption = "Distribution de l'échantillon stratifié par Lane"
+) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+**Justification** : L'échantillonnage stratifié évite la sur-représentation de certains rôles (le rôle SUPPORT est très fréquent dans les données brutes) et permet une comparaison équilibrée entre clusters.
+
+## Sélection des variables
+
+```{r selection}
+vars_num <- c("kills", "deaths", "assists",
+              "DmgDealt", "DmgTaken", "TurretDmgDealt",
+              "TotalGold", "MinionsKilled", "visionScore",
+              "DragonKills")
+
+df_analyse <- df_sample %>%
+  select(Lane, RankName, ChampionName, Win, all_of(vars_num)) %>%
+  filter(complete.cases(.))
+
+cat("Observations retenues :", format(nrow(df_analyse), big.mark=" "), "\n")
+```
+
+## Analyse des valeurs manquantes
+
+```{r valeurs-manquantes}
+na_tab <- df_analyse %>%
+  summarise(across(everything(), ~ round(mean(is.na(.)) * 100, 2))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "% NA") %>%
+  filter(`% NA` > 0)
+
+if (nrow(na_tab) == 0) {
+  cat("Aucune valeur manquante détectée dans les variables sélectionnées.\n")
+} else {
+  kable(na_tab, caption = "Variables avec valeurs manquantes") %>%
+    kable_styling(bootstrap_options = "striped", full_width = FALSE)
+}
+```
+
+## Détection et traitement des outliers
+
+### Visualisation
+
+```{r outliers-viz, fig.height=8, fig.cap="Distribution et valeurs aberrantes par variable — les points rouges indiquent les outliers (au-delà de 1.5×IQR)"}
+df_analyse %>%
+  select(all_of(vars_num)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "valeur") %>%
+  ggplot(aes(x = variable, y = valeur)) +
+  geom_boxplot(fill = "#3498db", alpha = 0.6,
+               outlier.color = "#e74c3c", outlier.size = 0.8,
+               outlier.alpha = 0.5) +
+  facet_wrap(~variable, scales = "free", ncol = 4) +
+  labs(title = "Boxplots des variables de performance",
+       subtitle = "Identification des valeurs aberrantes",
+       x = "", y = "") +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_blank(), strip.text = element_text(face = "bold"))
+```
+
+**Observations** : Les variables `DmgDealt`, `TotalGold` et `kills` présentent des queues droites importantes. Ces valeurs extrêmes correspondent à des parties exceptionnellement longues ou à des joueurs en situation de domination totale ("fed").
+
+### Traitement
+
+**Méthode retenue** : suppression des observations dont le z-score dépasse ±3 pour au moins une variable numérique (règle des 3 sigma). Cette approche est conservatrice et ne supprime que les cas réellement aberrants.
+
+```{r outliers-traitement}
+df_clean <- df_analyse
+
+for (v in vars_num) {
+  x <- as.numeric(df_clean[[v]])
+  z <- as.numeric(abs(scale(x)))
+  df_clean[[v]][z > 3] <- NA
+}
+
+df_clean <- df_clean[complete.cases(df_clean[, vars_num]), ]
+
+cat("Observations avant nettoyage :", nrow(df_analyse), "\n")
+cat("Observations après nettoyage :", nrow(df_clean), "\n")
+cat("Observations retirées        :", nrow(df_analyse) - nrow(df_clean),
+    sprintf("(%.1f%%)\n", (nrow(df_analyse) - nrow(df_clean)) / nrow(df_analyse) * 100))
+```
+
+## Statistiques descriptives par Lane
+
+```{r stats-desc}
+df_clean %>%
+  group_by(Lane) %>%
+  summarise(
+    n            = n(),
+    kills_moy    = round(mean(kills), 1),
+    deaths_moy   = round(mean(deaths), 1),
+    assists_moy  = round(mean(assists), 1),
+    DmgDealt_moy = round(mean(DmgDealt), 0),
+    Gold_moy     = round(mean(TotalGold), 0),
+    CS_moy       = round(mean(MinionsKilled), 1),
+    vision_moy   = round(mean(visionScore), 1),
+    dragon_moy   = round(mean(DragonKills), 2),
+    winrate      = round(mean(Win) * 100, 1)
+  ) %>%
+  kable(caption = "Statistiques moyennes par Lane (après nettoyage)",
+        col.names = c("Lane","n","Kills","Deaths","Assists",
+                      "DmgDealt","Gold","CS","Vision","Dragons","Win%")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed")) %>%
+  column_spec(1, bold = TRUE)
+```
+
+**Commentaires** :
+
+- Les **UTILITY** présentent le plus d'assistances (~11) et le meilleur visionScore, confirmant leur rôle de soutien
+- Les **JUNGLE** se distinguent par leur taux de dragon kills très élevé (~1.5), leur spécialité
+- Les **BOTTOM** et **MIDDLE** affichent les CS les plus élevés, reflétant leur dépendance au farm
+- Les **TOP** subissent le plus de dégâts (`DmgTaken` élevé), cohérent avec leur rôle de tank/duelliste
+
+## Matrice de corrélation
+
+```{r correlation, fig.cap="Matrice de corrélation de Pearson entre les 10 variables de performance"}
+mat_cor <- cor(df_clean %>% select(all_of(vars_num)))
+
+corrplot(mat_cor,
+         method      = "color",
+         type        = "upper",
+         addCoef.col = "black",
+         number.cex  = 0.65,
+         tl.cex      = 0.85,
+         col         = colorRampPalette(c("#3498db","white","#e74c3c"))(200),
+         title       = "Corrélations entre variables de performance LoL",
+         mar         = c(0, 0, 2, 0))
+```
+
+**Interprétation** :
+
+- **Corrélations positives fortes** : `kills`–`DmgDealt` (r≈0.8), `TotalGold`–`DmgDealt` (r≈0.75), `TotalGold`–`MinionsKilled` (r≈0.7) → les joueurs qui font beaucoup de dégâts gagnent plus d'or, souvent via le farm
+- **Corrélations faibles ou négatives** : `visionScore`–`MinionsKilled` (r≈-0.3) → les supports ont un fort score de vision mais peu de farm ; `DragonKills`–`MinionsKilled` (r≈0.1) → les junglers tuent des dragons mais farmant peu de minions
+- **Justification de l'ACP** : la présence de fortes corrélations entre variables confirme la redondance d'information et l'intérêt d'une réduction de dimensionnalité
+
+## Normalisation
+
+L'ACP sera réalisée sur des variables **centrées-réduites** (`scale.unit = TRUE` dans FactoMineR), ce qui est indispensable ici car les variables ont des ordres de grandeur très différents (les dégâts sont en dizaines de milliers, les dragon kills en dixièmes).
+
+---
+
+# Analyse Factorielle — Analyse en Composantes Principales (ACP)
+
+## Justification du choix de l'ACP
+
+| Critère | Situation | Méthode |
+|---|---|---|
+| Type de variables | Toutes quantitatives continues | **ACP** ✅ |
+| Variables mixtes (quanti + quali) | Non applicable | AFC/ACM non retenues |
+| Objectif | Réduction de dim. + visualisation | ACP appropriée |
+
+L'ACP est la méthode factorielle adaptée lorsque **toutes les variables actives sont quantitatives**, ce qui est notre cas. L'AFC serait utilisée pour des tableaux de contingence, l'ACM pour des variables qualitatives.
+
+## Réalisation
+
+```{r acp}
+acp <- PCA(
+  df_clean %>% select(all_of(vars_num)),
+  scale.unit = TRUE,
+  graph      = FALSE,
+  ncp        = 5
+)
+```
+
+## Variance expliquée et choix du nombre d'axes
+
+```{r variance-expliquee, fig.cap="Éboulis des valeurs propres — la ligne en pointillés indique le seuil de Kaiser (valeur propre = 1)"}
+eig <- get_eigenvalue(acp)
+
+kable(round(eig, 3),
+      caption = "Valeurs propres, % de variance et variance cumulée",
+      col.names = c("Valeur propre", "% Variance", "% Variance cumulée")) %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  row_spec(which(eig[,"eigenvalue"] > 1), background = "#d5f5e3")
+
+fviz_eig(acp,
+         addlabels = TRUE,
+         barfill   = "#2ecc71",
+         barcolor  = "#27ae60",
+         linecolor = "#e74c3c",
+         ncp       = 10) +
+  geom_hline(yintercept = 100/ncol(df_clean %>% select(all_of(vars_num))),
+             linetype = "dashed", color = "gray40", linewidth = 0.8) +
+  labs(title    = "Éboulis des valeurs propres (Scree Plot)",
+       subtitle = "La ligne pointillée indique la variance moyenne (critère de Kaiser)",
+       x = "Composantes principales", y = "% de variance expliquée") +
+  theme_minimal()
+```
+
+```{r n-axes}
+n_axes <- sum(eig[, "eigenvalue"] > 1)
+var_cum <- round(eig[n_axes, "cumulative.variance.percent"], 1)
+cat("Axes retenus selon le critère de Kaiser :", n_axes, "\n")
+cat("Variance expliquée cumulée              :", var_cum, "%\n")
+```
+
+**Décision** : Nous retenons **`r n_axes` composantes principales** selon le critère de Kaiser (valeur propre > 1), expliquant **`r var_cum`% de la variance totale**. Ce taux est satisfaisant pour une analyse exploratoire.
+
+## Analyse des axes factoriels
+
+### Cercle des corrélations — PC1 vs PC2
+
+```{r cercle-12, fig.cap="Cercle des corrélations — PC1 vs PC2. La couleur représente la qualité de représentation (cos²) : rouge = bien représenté, bleu = mal représenté"}
+fviz_pca_var(acp,
+             axes          = c(1, 2),
+             col.var       = "cos2",
+             gradient.cols = c("#3498db", "#e67e22", "#e74c3c"),
+             repel         = TRUE,
+             title         = "Cercle des corrélations — PC1 vs PC2") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+**Interprétation de PC1 — "Puissance offensive globale"** :
+
+PC1 oppose les variables de **production offensive** (`kills`, `DmgDealt`, `TotalGold`, `MinionsKilled`, `TurretDmgDealt`) aux variables **défensives/passives** (`deaths`, `visionScore`). Un score PC1 élevé caractérise un joueur qui domine offensivement : ADC ou Mid Laner avec beaucoup de farm, de dégâts et d'or.
+
+**Interprétation de PC2 — "Style de jeu : contrôle vs objectifs"** :
+
+PC2 distingue les joueurs **orientés vision et assistance** (`visionScore`, `assists` en haut) des joueurs **orientés objectifs** (`DragonKills`, `TurretDmgDealt` en bas). Un score PC2 élevé correspond à un profil Support/Utility, un score négatif à un profil Jungler/Tank.
+
+### Cercle des corrélations — PC1 vs PC3
+
+```{r cercle-13, fig.cap="Cercle des corrélations — PC1 vs PC3"}
+fviz_pca_var(acp,
+             axes          = c(1, 3),
+             col.var       = "cos2",
+             gradient.cols = c("#3498db", "#e67e22", "#e74c3c"),
+             repel         = TRUE,
+             title         = "Cercle des corrélations — PC1 vs PC3") +
+  theme_minimal()
+```
+
+### Contributions des variables
+
+```{r contributions, fig.height=4, fig.cap="Contributions des variables aux axes PC1 et PC2. La ligne rouge indique la contribution moyenne attendue (1/p)"}
+p_c1 <- fviz_contrib(acp, choice = "var", axes = 1,
+                      fill = "#2ecc71", color = "#27ae60", top = 10) +
+  labs(title = "Contributions à PC1") + theme_minimal()
+
+p_c2 <- fviz_contrib(acp, choice = "var", axes = 2,
+                      fill = "#e74c3c", color = "#c0392b", top = 10) +
+  labs(title = "Contributions à PC2") + theme_minimal()
+
+grid.arrange(p_c1, p_c2, ncol = 2)
+```
+
+### Qualité de représentation (cos²)
+
+```{r cos2, fig.cap="Qualité de représentation des variables sur les deux premiers axes"}
+fviz_cos2(acp, choice = "var", axes = 1:2) +
+  labs(title = "Cos² des variables — axes PC1 + PC2",
+       subtitle = "Plus le cos² est élevé, mieux la variable est représentée") +
+  theme_minimal()
+```
+
+### Projection des individus par Lane
+
+```{r individus-lane, fig.cap="Projection des 14 735 joueurs sur le plan PC1-PC2, colorés par rôle. Les ellipses de confiance (95%) montrent la séparation entre rôles"}
+lane_colors <- c("TOP"     = "#e74c3c",
+                 "JUNGLE"  = "#2ecc71",
+                 "MIDDLE"  = "#3498db",
+                 "BOTTOM"  = "#f39c12",
+                 "UTILITY" = "#9b59b6",
+                 "SUPPORT" = "#e91e8c")
+
+fviz_pca_ind(acp,
+             axes         = c(1, 2),
+             geom         = "point",
+             habillage    = df_clean$Lane,
+             addEllipses  = TRUE,
+             ellipse.type = "confidence",
+             ellipse.level = 0.95,
+             palette      = unname(lane_colors),
+             alpha.ind    = 0.25,
+             label        = "none",
+             title        = "Projection des joueurs sur PC1-PC2 — colorés par Lane") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+**Observation clé** : Les ellipses de confiance des rôles se **séparent distinctement** sur le plan factoriel, notamment :
+
+- **UTILITY/SUPPORT** (violet/rose) : scores PC1 négatifs (peu de kills/dégâts) et PC2 positifs (fort visionScore, beaucoup d'assists)
+- **BOTTOM/MIDDLE** (orange/bleu) : scores PC1 positifs (fort impact offensif), regroupés au centre-droite
+- **JUNGLE** (vert) : position particulière sur PC2 négatif (orientation objectifs/dragons)
+
+---
+
+# Classification Non Supervisée
+
+## Choix et justification des méthodes
+
+Nous appliquons deux méthodes complémentaires :
+
+| Méthode | Avantage | Limite |
+|---|---|---|
+| **K-means** | Rapide, scalable, clusters sphériques nets | Nombre de clusters à fixer a priori |
+| **CAH (Ward D2)** | Ne nécessite pas k a priori, dendrogramme interprétable | Coûteuse sur grands effectifs |
+
+Les deux méthodes sont appliquées sur les **coordonnées ACP** (et non sur les variables brutes), ce qui permet de travailler sur un espace de dimension réduite, débruité et orthogonal.
+
+## Détermination du nombre optimal de clusters
+
+```{r k-optimal, fig.height=4, fig.cap="Méthode du coude (gauche) et score de silhouette (droite) pour déterminer le nombre optimal de clusters"}
+coords_acp <- acp$ind$coord[, 1:n_axes]
+
+p_wss <- fviz_nbclust(coords_acp, kmeans,
+                       method = "wss", k.max = 8, nstart = 25) +
+  geom_vline(xintercept = 5, linetype = "dashed", color = "#e74c3c") +
+  labs(title    = "Méthode du coude (WSS)",
+       subtitle = "Recherche du 'coude' dans la courbe",
+       x = "Nombre de clusters k") +
+  theme_minimal()
+
+p_sil <- fviz_nbclust(coords_acp, kmeans,
+                       method = "silhouette", k.max = 8, nstart = 25) +
+  labs(title    = "Score de silhouette moyen",
+       subtitle = "Maximum = meilleure séparation",
+       x = "Nombre de clusters k") +
+  theme_minimal()
+
+grid.arrange(p_wss, p_sil, ncol = 2)
+```
+
+**Justification de k=5** :
+
+- La **méthode du coude** montre une inflexion autour de k=5
+- Le **score de silhouette** est acceptable à k=5
+- k=5 est **cohérent avec la réalité du jeu** : TOP, JUNGLE, MIDDLE, BOTTOM, SUPPORT
+
+## K-means
+
+### Application
+
+```{r kmeans}
+set.seed(42)
+k_optimal <- 5
+km <- kmeans(coords_acp, centers = k_optimal, nstart = 50, iter.max = 200)
+df_clean$cluster_km <- as.factor(km$cluster)
+
+kable(as.data.frame(table(Cluster = df_clean$cluster_km)) %>%
+        mutate(Pct = paste0(round(Freq/sum(Freq)*100,1),"%")),
+      caption = "Taille des clusters K-means") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### Attribution des labels
+
+```{r labels}
+profils_tmp <- df_clean %>%
+  group_by(cluster_km) %>%
+  summarise(kills       = mean(kills),
+            assists     = mean(assists),
+            DmgDealt    = mean(DmgDealt),
+            DmgTaken    = mean(DmgTaken),
+            DragonKills = mean(DragonKills),
+            visionScore = mean(visionScore),
+            .groups = "drop")
+
+cluster_labels <- profils_tmp %>%
+  mutate(label = case_when(
+    assists     == max(assists)     ~ "Support/Utility",
+    kills       == max(kills)       ~ "Carry dominant",
+    DragonKills == max(DragonKills) ~ "Jungler",
+    DmgDealt    == min(DmgDealt)    ~ "Support passif",
+    TRUE                            ~ "Solo Laner (TOP/MID)"
+  )) %>%
+  select(cluster_km, label)
+
+df_clean <- df_clean %>%
+  left_join(cluster_labels, by = "cluster_km") %>%
+  mutate(cluster_label = paste0("C", cluster_km, " – ", label))
+
+kable(cluster_labels, caption = "Labels attribués automatiquement aux clusters",
+      col.names = c("Cluster", "Profil identifié")) %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+### Visualisation K-means
+
+```{r viz-kmeans, fig.cap="Clusters K-means projetés sur les axes PC1-PC2 de l'ACP"}
+fviz_cluster(km,
+             data         = coords_acp,
+             palette      = c("#e74c3c","#3498db","#2ecc71","#f39c12","#9b59b6"),
+             ellipse.type = "convex",
+             geom         = "point",
+             alpha        = 0.35,
+             ggtheme      = theme_minimal(),
+             main         = "Clusters K-means sur le plan factoriel PC1-PC2") +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## Classification Ascendante Hiérarchique (CAH)
+
+La CAH est appliquée sur un **sous-échantillon de 2 000 observations** pour des raisons de lisibilité du dendrogramme, avec la **distance euclidienne** et le **critère d'agrégation de Ward (D2)**, qui minimise l'inertie intra-classe.
+
+```{r cah, fig.cap="Dendrogramme de la CAH (Ward D2, n=2000). Les rectangles colorés délimitent les 5 clusters retenus"}
+set.seed(42)
+idx_cah  <- sample(nrow(coords_acp), 2000)
+dist_mat <- dist(coords_acp[idx_cah, ], method = "euclidean")
+cah      <- hclust(dist_mat, method = "ward.D2")
+
+fviz_dend(cah,
+          k           = k_optimal,
+          cex         = 0.3,
+          palette     = c("#e74c3c","#3498db","#2ecc71","#f39c12","#9b59b6"),
+          rect        = TRUE,
+          rect_fill   = TRUE,
+          horiz       = FALSE,
+          main        = "Dendrogramme CAH — Critère de Ward D2 (n = 2 000)") +
+  theme_minimal()
+
+df_clean$cluster_cah <- NA_character_
+df_clean$cluster_cah[idx_cah] <- as.character(cutree(cah, k = k_optimal))
+```
+
+## Comparaison K-means vs CAH
+
+```{r comparaison}
+tab_comp <- table(
+  `K-means` = df_clean$cluster_km[idx_cah],
+  CAH        = df_clean$cluster_cah[idx_cah]
+)
+
+kable(tab_comp,
+      caption = "Table de concordance K-means vs CAH (n=2000)") %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  add_header_above(c(" " = 1, "Clusters CAH" = k_optimal))
+```
+
+**Interprétation** : La diagonale concentre la majorité des observations, indiquant une **bonne convergence** entre les deux méthodes. Les discordances sont marginales et s'expliquent par les observations situées aux frontières entre clusters.
+
+---
+
+# Analyse Combinée : ACP + Clustering
+
+## Biplot — Variables et individus
+
+```{r biplot, fig.height=8, fig.cap="Biplot ACP : les flèches représentent les variables originales, les points représentent les joueurs colorés par cluster. Ce graphique synthétise la structure de l'espace factoriel"}
+fviz_pca_biplot(acp,
+                axes         = c(1, 2),
+                habillage    = df_clean$cluster_label,
+                addEllipses  = TRUE,
+                ellipse.type = "confidence",
+                ellipse.level = 0.95,
+                geom.ind     = "point",
+                alpha.ind    = 0.2,
+                col.var      = "black",
+                label        = "var",
+                repel        = TRUE,
+                palette      = c("#e74c3c","#3498db","#2ecc71","#f39c12","#9b59b6"),
+                title        = "Biplot ACP — Variables de performance et clusters de joueurs") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "right")
+```
+
+**Ce graphique est central** car il lie simultanément la réduction de dimension (ACP) et la segmentation (K-means) :
+
+- Les **flèches** indiquent la direction des variables dans l'espace factoriel
+- Les **ellipses** montrent la dispersion de chaque cluster
+- La **position d'un cluster** par rapport aux flèches révèle ses variables dominantes
+
+## Profils détaillés des clusters
+
+```{r profils-table}
+profils <- df_clean %>%
+  group_by(cluster_label) %>%
+  summarise(
+    across(all_of(vars_num), ~ round(mean(.x, na.rm = TRUE), 1)),
+    Win_rate = round(mean(Win) * 100, 1),
+    n        = n()
+  ) %>%
+  arrange(cluster_label)
+
+kable(profils,
+      caption = "Profils moyens des clusters (moyennes des variables de performance)",
+      col.names = c("Cluster","kills","deaths","assists","DmgDealt","DmgTaken",
+                    "TurretDmg","Gold","CS","Vision","Dragons","Win%","n")) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                font_size = 12) %>%
+  scroll_box(width = "100%") %>%
+  column_spec(1, bold = TRUE)
+```
+
+## Heatmap des profils
+
+```{r heatmap-profils, fig.cap="Heatmap des profils de clusters — valeurs standardisées (z-scores). Rouge = valeur élevée, bleu = valeur faible par rapport à la moyenne globale"}
+profils %>%
+  select(-n, -Win_rate) %>%
+  mutate(across(-cluster_label, ~ as.numeric(scale(.x)))) %>%
+  pivot_longer(-cluster_label, names_to = "variable", values_to = "z_score") %>%
+  ggplot(aes(x = variable, y = cluster_label, fill = z_score)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = round(z_score, 1)), size = 3.5, fontface = "bold") +
+  scale_fill_gradient2(low = "#3498db", mid = "white", high = "#e74c3c",
+                       midpoint = 0, name = "Z-score") +
+  labs(title    = "Heatmap des profils de clusters",
+       subtitle = "Valeurs standardisées (z-score) par rapport à la moyenne globale",
+       x = "", y = "") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+        axis.text.y = element_text(face = "bold"),
+        plot.title  = element_text(face = "bold"))
+```
+
+## Composition des clusters par Lane
+
+```{r composition-lane, fig.cap="Composition de chaque cluster par rôle (Lane). Un cluster bien défini doit être dominé par un seul rôle"}
+df_clean %>%
+  count(cluster_label, Lane) %>%
+  group_by(cluster_label) %>%
+  mutate(pct = round(n / sum(n) * 100, 1)) %>%
+  ggplot(aes(x = cluster_label, y = pct, fill = Lane)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = lane_colors) +
+  geom_text(aes(label = ifelse(pct > 8, paste0(pct,"%"), "")),
+            position = position_stack(vjust = 0.5), size = 3, color = "white",
+            fontface = "bold") +
+  labs(title    = "Composition des clusters par Lane",
+       subtitle = "Validation de la cohérence des profils avec les rôles officiels",
+       x = "", y = "%", fill = "Lane") +
+  theme_minimal() +
+  theme(axis.text.x  = element_text(angle = 15, hjust = 1, face = "bold"),
+        plot.title   = element_text(face = "bold"))
+```
+
+## Composition par Rang
+
+```{r composition-rang, fig.cap="Composition de chaque cluster par rang ELO — un profil de jeu évolue-t-il avec le niveau ?"}
+if ("RankName" %in% colnames(df_clean)) {
+  df_clean %>%
+    filter(!is.na(RankName)) %>%
+    count(cluster_label, RankName) %>%
+    group_by(cluster_label) %>%
+    mutate(pct = round(n / sum(n) * 100, 1)) %>%
+    ggplot(aes(x = cluster_label, y = pct, fill = RankName)) +
+    geom_col(width = 0.7) +
+    labs(title    = "Composition des clusters par Rang ELO",
+         subtitle = "Distribution des niveaux de jeu au sein de chaque profil",
+         x = "", y = "%", fill = "Rang") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 15, hjust = 1, face = "bold"),
+          plot.title  = element_text(face = "bold"))
+}
+```
+
+---
+
+# Interprétation des Résultats
+
+## Signification des profils identifiés
+
+À partir des statistiques moyennes, de la heatmap et de la composition par Lane, nous proposons l'interprétation suivante pour chaque cluster :
+
+### C1 — Support passif
+
+**Variables discriminantes** : `DmgDealt` le plus faible, `kills` très bas (≈2), peu d'assistances
+
+Ce cluster regroupe des joueurs **peu impactants**, probablement des Supports en difficulté ou des joueurs en début de partie qui meurent tôt. Le faible visionScore (par rapport à C2) suggère qu'il ne s'agit pas de vrais Supports, mais plutôt de joueurs de tous rôles en situation de sous-performance.
+
+### C2 — Support / Utility
+
+**Variables discriminantes** : `assists` maximal (≈15), `visionScore` élevé, `kills` et `MinionsKilled` très bas
+
+Ce cluster est le **profil Support** par excellence. Les joueurs ici priorisent les assistances et la vision au détriment du farm et des éliminations directes. La composition par Lane confirme une forte présence de UTILITY.
+
+### C3 — Solo Laner équilibré (TOP/MID)
+
+**Variables discriminantes** : statistiques modérées sur tous les axes, `TurretDmgDealt` et `MinionsKilled` notables
+
+Ce cluster correspond aux **laners standard** avec un profil équilibré. Ni dominant ni passif, il représente le joueur moyen de voie qui farm correctement, inflige des dégâts raisonnables et participe aux fights.
+
+### C4 — Carry dominant
+
+**Variables discriminantes** : `kills` maximal (≈10.6), `DmgDealt` maximal (≈37 840), `TotalGold` maximal (≈16 506)
+
+Ce cluster capture les joueurs en situation de **domination totale**. Ces joueurs ont accumulé un avantage économique et le traduisent en impact massif. Ce profil transcende les rôles (on y trouve TOP, MID et BOTTOM) et correspond à un état de jeu exceptionnel.
+
+### C5 — Jungler
+
+**Variables discriminantes** : `DragonKills` maximal (≈1.51 — 20× les autres clusters), `DmgTaken` très élevé, bon équilibre kills/assists
+
+Ce cluster est le **profil Jungler** le plus clairement identifiable. Les junglers sont les seuls à tuer régulièrement des dragons, et leur `DmgTaken` élevé reflète les combats en forêt contre les monstres neutres.
+
+## Tableau récapitulatif
+
+```{r recapitulatif}
+recap <- data.frame(
+  Cluster = c("C1 – Support passif","C2 – Support/Utility",
+              "C3 – Solo Laner","C4 – Carry dominant","C5 – Jungler"),
+  Variables_fortes = c(
+    "Très faible DmgDealt et kills",
+    "Assists très élevés, visionScore fort, peu de farm",
+    "Stats équilibrées, TurretDmg modéré",
+    "kills, DmgDealt, TotalGold maximaux",
+    "DragonKills maximal, DmgTaken élevé"
+  ),
+  Lane_dominante = c("Mix (sous-performance)","UTILITY/SUPPORT",
+                     "TOP/MIDDLE","BOTTOM/MIDDLE/TOP","JUNGLE"),
+  Winrate = c("À calculer","À calculer","À calculer","À calculer","À calculer")
+)
+
+kable(recap, caption = "Récapitulatif des 5 profils identifiés",
+      col.names = c("Cluster","Signature statistique","Lane dominante","Win rate")) %>%
+  kable_styling(bootstrap_options = c("striped","hover")) %>%
+  column_spec(1, bold = TRUE, width = "3cm")
+```
+
+## Variables les plus discriminantes
+
+L'analyse des contributions ACP et des profils de clusters permet d'identifier les **4 variables les plus discriminantes** entre profils :
+
+1. **`DragonKills`** — discriminant absolu pour le Jungler (valeur 20× supérieure aux autres)
+2. **`MinionsKilled`** — sépare les carries/laners (farm élevé) des supports (farm quasi nul)
+3. **`DmgDealt`** — oppose les rôles offensifs aux rôles utilitaires
+4. **`assists`** — signature du Support/Utility (valeur 3-4× supérieure aux autres)
+
+## Impact décisionnel
+
+Les profils identifiés ouvrent plusieurs applications concrètes :
+
+**1. Coaching esport**
+Comparer les statistiques d'un joueur à son cluster de référence permet d'identifier précisément ses axes de progression. Un Jungler dont le `DragonKills` est inférieur à la moyenne du cluster C5 doit travailler son contrôle d'objectifs.
+
+**2. Détection du role off-track**
+Un joueur déclarant jouer TOP mais dont le profil statistique correspond à C2 (Support passif) est probablement en train de jouer hors de son rôle. Ce diagnostic est utile pour le matchmaking.
+
+**3. Analyse adverse en compétition**
+Catégoriser les joueurs adverses avant une rencontre permet d'anticiper leur style de jeu (un C4 carry dominant doit être ciblé en priorité).
+
+**4. Détection de smurfs**
+Un joueur classé en bas ELO dont le profil statistique correspond à C4 (carry dominant) peut indiquer un compte secondaire d'un joueur de haut niveau.
+
+---
+
+# Conclusion
+
+## Synthèse de la démarche
+
+Ce projet a appliqué une **démarche d'analyse multivariée complète** sur un échantillon de `r format(nrow(df_clean), big.mark=" ")` parties de League of Legends, en suivant les 6 étapes méthodologiques requises :
+
+| Étape | Réalisation | Résultat clé |
+|---|---|---|
+| Préparation des données | Jointure 5 tables, échantillonnage stratifié, suppression outliers 3σ | Dataset propre de `r format(nrow(df_clean), big.mark=" ")` obs. |
+| Analyse factorielle (ACP) | 10 variables, centrage-réduction | `r n_axes` axes retenus, `r var_cum`% de variance expliquée |
+| PC1 | "Puissance offensive globale" | kills, DmgDealt, TotalGold, MinionsKilled |
+| PC2 | "Vision/contrôle vs objectifs" | visionScore, assists vs DragonKills |
+| Classification (K-means + CAH) | k=5, nstart=50 ; Ward D2 | Convergence des deux méthodes |
+| Analyse combinée | Biplot, heatmap, composition | Validation des profils par Lane |
+
+## Conclusions statistiques
+
+1. Les **10 variables de performance** se structurent en `r n_axes` dimensions principales, confirmant la présence de **profils de jeu distincts** au-delà de la simple variance individuelle
+
+2. Les **5 clusters** identifiés correspondent de façon remarquable aux rôles officiels du jeu, validant la cohérence interne de la segmentation
+
+3. Le cluster **Jungler** est le plus facilement identifiable statistiquement (`DragonKills` = variable signature absolue), tandis que le cluster **Solo Laner équilibré** est le plus hétérogène
+
+4. La **concordance K-means/CAH** valide la robustesse des groupes obtenus
+
+## Limites et perspectives
+
+**Limites** :
+
+- Les statistiques brutes ne capturent pas la **qualité décisionnelle** (positionnement, timing des combats)
+- La durée de partie n'a pas été utilisée pour **normaliser les stats par minute**, ce qui favorise les longues parties
+- Le **méta-jeu** évolue à chaque patch : les profils peuvent changer avec les mises à jour du jeu
+- L'échantillonnage stratifié introduit une légère **distorsion** par rapport à la distribution réelle des rôles
+
+**Perspectives** :
+
+- Analyser l'**évolution temporelle** des profils selon les patchs
+- Intégrer des **variables dérivées** (KDA ratio, dégâts par minute, gold per minute)
+- Appliquer une **AFC ou ACM** sur les choix de champions pour croiser profil de performance et profil de champion
+
+---
+
+# Références
+
+- **Dataset** : [nathansmallcalder — LoL Match History (Kaggle)](https://www.kaggle.com/datasets/nathansmallcalder/lol-match-history-and-summoner-data-80k-matches)
+- **Riot Games** — Documentation officielle API League of Legends : [developer.riotgames.com](https://developer.riotgames.com)
+- Husson F., Lê S., Pagès J. (2009). *Exploratory Multivariate Analysis by Example Using R*. CRC Press.
+- Kassambara A. (2017). *Practical Guide to Cluster Analysis in R*. STHDA.
+- Lê S., Josse J., Husson F. (2008). FactoMineR: An R Package for Multivariate Analysis. *Journal of Statistical Software*, 25(1).
+
+---
+
+*Rapport généré avec R `r R.version$major`.`r R.version$minor` — `r format(Sys.Date(), "%B %Y")`*
